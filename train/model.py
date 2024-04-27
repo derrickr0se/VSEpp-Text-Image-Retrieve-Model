@@ -117,6 +117,9 @@ class ImageEncoder(nn.Module):
         self.mapping.bias.data.fill_(0)  # 将偏置初始化为0
 
     def forward(self, images):
+        """
+            提取图像特征向量
+        """
         features = self.cnn(images)
         features = self.relu(features)
         features = self.mapping(features)
@@ -174,20 +177,17 @@ class TextEncoder(nn.Module):
         # 对应TextEncoder中的Average Pooling层
         self.rnn_mean_pool = rnn_mean_pool
 
-    def forward(self, texts, lengths):  # lengths记录每个序列的实际长度(不包含填充)
-        embeds = self.embed(texts)  # 转换文本为词嵌入向量
-        packed = pack_padded_sequence(embeds, lengths, batch_first=True)  # 将填充后的序列转换成压缩形式，去除填充部分的数据
+    def forward(self, x, lengths):  # lengths记录每个序列的实际长度(不包含填充)
+        x = self.embed(x)  # 转换文本为词嵌入向量
+        packed = pack_padded_sequence(x, lengths, batch_first=True)  # 将填充后的序列转换成压缩形式，去除填充部分的数据
+
         output, _ = self.rnn(packed)
-        output, _ = pad_packed_sequence(output,
-                                        batch_first=True)  # 对RNN输出进行填充解压，恢复原来的形状 (batch_size, max_seq_length, embed_size)
+        output, _ = pad_packed_sequence(output, batch_first=True)  # 对RNN输出进行填充解压，恢复原来的形状 (batch_size, max_seq_length, embed_size)
 
         if self.rnn_mean_pool:
-            lengths_tensor = torch.LongTensor(lengths).view(-1,
-                                                            1)  # 将长度信息的列表lengths转换为张量，并将其形状调整为(batch_size, 1)，-1表示占位符,以便进行下面的除法
-            output = torch.sum(output,
-                               dim=1)  # 对输出进行求和操作，沿着序列长度的维度（dim=1）求和，得到每个样本的总和，同时将其形状调整为(batch_size, 1, embed_size)
-            output = torch.div(output,
-                               lengths_tensor.expand_as(output).to(DEVICE))  # 将长度张量lengths_tensor扩展成与output相同的形状,再相除
+            len_tensor = torch.LongTensor(lengths).view(-1, 1)  # 将lengths转换为张量，并将其形状调整为(batch_size, 1),以便进行下面的除法
+            output = torch.sum(output, dim=1)  # 对输出进行求和操作，沿着序列长度的维度（dim=1）求和,其形状变为(batch_size, 1, embed_size)
+            output = torch.div(output, len_tensor.expand_as(output).to(DEVICE))
 
         output = self.linear(output)
         output = f.normalize(output, p=2, dim=1)  # L2 Normalize
@@ -286,6 +286,7 @@ class ContrastiveLoss(nn.Module):
     """
         计算对比损失hinge-loss
     """
+
     def __init__(self, margin, max_violation):
         super(ContrastiveLoss, self).__init__()
         self.margin = margin
@@ -299,11 +300,11 @@ class ContrastiveLoss(nn.Module):
         sim_score = cosine_sim(images, captions)
         # 由 batch的构造方式(collate_fn中的zip(*batch))得知，对角线上的图片和文本一定匹配,取其作为正样本,并将得到的对角线元素向量重新塑造为一个(batch_size, 1)的列向量
         positive = sim_score.diag().view(images.size(0), 1)
-        positive_image = positive.expand_as(sim_score)  # 图片的正样本得分向量,扩展为sim_score相同形状(batch_size, batch_size)，方便计算
-        positive_caption = positive.t().expand_as(sim_score)  # 文本的正样本得分向量,扩展为sim_score相同形状(batch_size, batch_size)，方便计算
+        positive_img = positive.expand_as(sim_score)  # 图片的正样本得分向量,扩展为sim_score相同形状(batch_size, batch_size)，方便计算
+        positive_cap = positive.t().expand_as(sim_score)  # 文本的正样本得分向量,扩展为sim_score相同形状(batch_size, batch_size)，方便计算
 
-        loss_cap2img = (self.margin + sim_score - positive_image).clamp(min=0)  # 以文搜图时的hinge-loss
-        loss_img2cap = (self.margin + sim_score - positive_caption).clamp(min=0)  # 以图搜文时的hinge-loss
+        loss_cap2img = (self.margin + sim_score - positive_img).clamp(min=0)  # 以文搜图时的hinge-loss
+        loss_img2cap = (self.margin + sim_score - positive_cap).clamp(min=0)  # 以图搜文时的hinge-loss
 
         mask = torch.eye(sim_score.size(0)) > 0.5  # 创建掩码矩阵，用于在计算损失时排除自身匹配的情况
         variable_mask = Variable(mask).to(DEVICE)  # 将mask转换为Variable对象
@@ -312,14 +313,16 @@ class ContrastiveLoss(nn.Module):
         loss_cap2img = loss_cap2img.masked_fill_(variable_mask, 0)
         loss_img2cap = loss_img2cap.masked_fill_(variable_mask, 0)
 
+        # 对每个查询采用最大违反负样本,而不再采用平均值
         if self.max_violation:  # 试试先用一般训练，再后面使用max_violation(失败)
-            loss_img2cap = loss_img2cap.max(1)[0]  # 以图搜文时，max(1)表示在行维度上查最大值，返回每行的最大值及其索引，[0]表示只要最大值，不要索引,形状变为(batch_size, 1)
+            loss_img2cap = loss_img2cap.max(1)[
+                0]  # 以图搜文时，max(1)表示在行维度上查最大值，返回每行的最大值及其索引，[0]表示只要最大值，不要索引,形状变为(batch_size, 1)
             loss_cap2img = loss_cap2img.max(0)[0]  # 以文搜图时
 
         # if loss_img2cap.mean() + loss_cap2img.mean() == torch.FloatTensor([0.4000]).to(DEVICE):
         #     # 很容易最大的那一个直接与负样本拉开0.2了， 把sim_score和posi_for_cap学成0
         #     print(sim_score)
-        #     print(positive_caption)
+        #     print(positive_cap)
 
         return loss_img2cap.mean() + loss_cap2img.mean()
 
@@ -328,6 +331,7 @@ class InfoNCE_contrastiveLoss(nn.Module):
     """
         使用InfoNCE对比损失
     """
+
     def __init__(self, temperature=0.1, reduction='mean', negative_mode='unpaired'):
         super(InfoNCE_contrastiveLoss, self).__init__()
         self.loss_calcer = InfoNCE(temperature, reduction, negative_mode)
@@ -349,7 +353,8 @@ class InfoNCE_contrastiveLoss(nn.Module):
             anchor_cap = caption.view(1, -1)  # 当前文本为锚样本
             positive_img = images[index].view(1, -1)  # 与当前文本索引相同的图片为正样本
             negative_imgs = images[torch.arange(images.shape[0]) != index]  # 与当前索引不同的所有图片为当前文本的负样本
-            all_loss[captions.shape[0] + index] = self.loss_calcer(anchor_cap, positive_img, negative_imgs)  # 分别传入锚样本,正样本,负样本计算loss
+            all_loss[captions.shape[0] + index] = self.loss_calcer(anchor_cap, positive_img,
+                                                                   negative_imgs)  # 分别传入锚样本,正样本,负样本计算loss
 
         return all_loss.mean()
 
@@ -385,6 +390,13 @@ class VSE(object):
         self.max_violation = max_violation
         self.grad_clip = grad_clip
         self.use_InfoNCE_loss = use_InfoNCE_loss
+        if not self.use_InfoNCE_loss:
+            self.contrastive_loss = ContrastiveLoss(self.margin, self.max_violation)
+        else:
+            self.contrastive_loss = InfoNCE_contrastiveLoss(
+                self.temperature.cpu().item(),
+                args.reduction,
+            )
         # 图像编码器
         self.image_encoder = ImageEncoder(embed_size, cnn_type, finetune).to(DEVICE)
         # 文本编码器
@@ -394,13 +406,16 @@ class VSE(object):
         else:
             self.text_encoder = Attention_Textencoder(vocab, word_dim, embed_size, num_heads, num_layers, use_word2vec,
                                                       rnn_mean_pool).to(DEVICE)
-        self.temperature = nn.Parameter(torch.FloatTensor([args.temperature]))  # 准备把温度系数加入训练
-        self.params = list(self.image_encoder.parameters()) + list(
-            self.text_encoder.parameters())  # 把图像编码器和文本编码器的参数合并成一个参数列表params
-        self.params.append(self.temperature)  # 把temperature也加入params，让优化器进行调整
-
-        self.optimizer = torch.optim.Adam(self.params, lr=args.lr)  # 使用Adam优化器
-        self.whole_iters = 0  # 记录迭代次数
+        # 准备把温度系数加入训练
+        self.temperature = nn.Parameter(torch.FloatTensor([args.temperature]))
+        # 把图像编码器和文本编码器的参数合并成一个参数列表params
+        self.params = list(self.image_encoder.parameters()) + list(self.text_encoder.parameters())
+        # 把temperature也加入params，让优化器进行调整
+        self.params.append(self.temperature)
+        # 使用Adam优化器
+        self.optimizer = torch.optim.Adam(self.params, lr=args.lr)
+        # 记录迭代次数
+        self.whole_iters = 0
 
     def state_dict(self):
         """
@@ -434,43 +449,46 @@ class VSE(object):
 
     def forward(self, images, captions, lengths):
         """
-            计算图片和文本的位置目标
+            计算图片和文本的 embeddings
         """
-        if not self.use_InfoNCE_loss:
-            self.contrastive_loss = ContrastiveLoss(self.margin, self.max_violation)
-        else:
-            self.contrastive_loss = InfoNCE_contrastiveLoss(
-                self.temperature.cpu().item(),
-                args.reduction,
-            )
+
         images = images.to(DEVICE)
         captions = captions.to(DEVICE)
-        image_features = self.image_encoder(images)
-        caption_features = self.text_encoder(captions, lengths)
+        # Forward
+        img_emb = self.image_encoder(images)
+        cap_emb = self.text_encoder(captions, lengths)
 
-        return image_features, caption_features
+        return img_emb, cap_emb
 
     def calc_loss(self, img_emb, cap_emb):
         """
             除了调用函数计算损失外，还得顺便记录logger
+            img_emb : (batch_size , embed_dim)
+            cap_emb : (batch_size , embed_dim)
         """
+        # 计算损失
         loss = self.contrastive_loss(img_emb, cap_emb)
         # 将损失值和批次中的样本数量(用于计算均值)一起记录到日志中
-        self.logger.update('Loss', loss.item(), img_emb.size(0))  # image即img_emb : (batch_size , embed_dim)
+        self.logger.update('Loss', loss.item(), img_emb.size(0))
 
         return loss
 
     def train(self, images, captions, lengths):
         """
-            对当前批次进行模型训练
+            对当前批次进行训练
         """
         self.train_model()  # 设置模型为训练模式
+
         self.whole_iters += 1
+
         self.logger.update('Iteration', self.whole_iters)
         self.logger.update('lr', self.optimizer.param_groups[0]['lr'])  # 通过索引[0]取出第一个参数组，然后从该参数组的字典中获取学习率信息
-        image_features, caption_features = self.forward(images, captions, lengths)
+
+        img_emb, cap_emb = self.forward(images, captions, lengths)
+
         self.optimizer.zero_grad()  # 梯度清零
-        loss = self.calc_loss(image_features, caption_features)  # 计算损失值并更新logger
+        loss = self.calc_loss(img_emb, cap_emb)  # 计算损失值并更新logger
+
         loss.backward()  # 对损失值进行反向传播
         if self.grad_clip:  # 梯度裁剪
             clip_grad_norm_(self.params, self.grad_clip)

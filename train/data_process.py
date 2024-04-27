@@ -8,7 +8,6 @@ import json
 
 
 class FlickrDataset(Dataset):
-
     def __init__(self, root, json_path, split, vocab, transform=None):
         """
             对Flickr30k中读取到的数据进行预处理并打包为Dataset
@@ -18,10 +17,10 @@ class FlickrDataset(Dataset):
         self.transform = transform
         self.dataset = json.load(open(json_path, 'r'))['images']
         self.ids = []
-        for idx, dataItem in enumerate(self.dataset):
-            if dataItem['split'] == split:
+        for img_idx, data in enumerate(self.dataset):
+            if data['split'] == split:
                 # 一张图片形成五个图文对的元组 [(i , 0) , (i , 1) , (i , 2) , (i , 3) , (i , 4)] 并加入ids中
-                self.ids += [(idx, captionIdx) for captionIdx in range(len(dataItem['sentences']))]
+                self.ids += [(img_idx, cap_idx) for cap_idx in range(len(data['sentences']))]
 
     def __getitem__(self, index):
         """
@@ -36,10 +35,10 @@ class FlickrDataset(Dataset):
         image = Image.open(os.path.join(self.root, img_path)).convert('RGB')
         # 获取描述文本
         caption = self.dataset[img_id]['sentences'][caption_id]['raw']
-        # 预处理图片信息，这里将图片转换成了张量
+        # 预处理图片信息,这里将图片转换成了张量
         if self.transform is not None:
             image = self.transform(image)
-        # 预处理文本信息
+        # 预处理文本信息,将文本(字符串)转换为词汇表中索引
         tokens = nltk.tokenize.word_tokenize(str(caption).lower())  # 将文本转换为小写并分词
         caption_ids = []
         caption_ids.append(self.vocab('<start>'))  # 加入<start>在词汇表中对应的索引
@@ -60,7 +59,16 @@ def collate_fn(batch):
     """
         默认的collate_fn有一个很大的限制:批数据必须处于同一维度
         这里由于文本不等长，必须自定义一个collate_fn函数
-        batch:大小为batch_size的由__getitem__()方法返回的(image, caption_ids_tensor, index)数据组
+
+        Args:
+            batch: list of (image, caption_ids_tensor, index) tuple.(长度为 batch_size)
+                - image: torch tensor of shape (3, 256, 256).
+                - caption_ids_tensor: torch tensor of shape (?); variable length.
+
+        Returns:
+            images: torch tensor of shape (batch_size, 3, 256, 256).
+            caption_ids_tensors: torch tensor of shape (batch_size, padded_length).
+            lengths: list; valid length for each padded caption.
     """
     batch.sort(key=lambda x: len(x[1]), reverse=True)  # 根据每个数据项的第二个元素（即描述文本）的长度降序排序
     # 这里保证了对于第i张图片，第i个文本一定是与其匹配的正样本，但由于一张图片对应五个文本，可能存在<i,j>(i!=j)也是匹配的正样本
@@ -68,7 +76,7 @@ def collate_fn(batch):
     # 整理图像
     images = torch.stack(images, dim=0)  # 将所有图像张量堆叠成一个张量，其中新增维度位于新张量的第一个位置，堆叠后形状为(batch_size, channel, height, width)
     # 整理文本
-    lengths = [len(cap) for cap in captions]
+    lengths = [len(cap) for cap in captions]  # 记录每个文本的实际长度(不含填充)
     caption_ids_tensors = torch.zeros(len(captions), max(lengths), dtype=torch.long)  # 创建一个形状为 (batch_size, max_seq_length) 的全零张量，用于存储所有描述文本的张量
     # 填充张量
     for index, caption in enumerate(captions):
@@ -80,16 +88,25 @@ def collate_fn(batch):
 
 def FlickrDataLoader(split, root, json_path, vocab, transform, batch_size, shuffle, num_workers, collate_fn=collate_fn):
     """
-        获取DataLoader
+        获取Flickr30k Dataset对应的DataLoader
     """
-    dataset = FlickrDataset(root, json_path, split, vocab, transform)
+    dataset = FlickrDataset(
+        root=root,
+        json_path=json_path,
+        split=split,
+        vocab=vocab,
+        transform=transform
+    )
+
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        pin_memory=True,
         num_workers=num_workers,
         collate_fn=collate_fn
     )
+
     return dataloader
 
 
@@ -123,38 +140,39 @@ def get_path(path='../data/'):
     return img_path, cap_path
 
 
-def get_train_dev_loader(vocab, batch_size, workers):
+def get_train_val_loader(vocab, batch_size, workers):
     """
         获取训练集或验证集的DataLoader
     """
     # 获取图片和文本路径
     img_path, cap_path = get_path()
     # 获取训练集的DataLoader
-    transform = get_transform('train')
+    train_transform = get_transform('train')
     train_loader = FlickrDataLoader(
         split='train',
         root=img_path,
         json_path=cap_path,
         vocab=vocab,
-        transform=transform,
+        transform=train_transform,
         batch_size=batch_size,
         shuffle=True,
         num_workers=workers,
         collate_fn=collate_fn
     )
     # 获取验证集的DataLoader
-    transform = get_transform('val')
+    val_transform = get_transform('val')
     val_loader = FlickrDataLoader(
         split='val',
         root=img_path,
         json_path=cap_path,
         vocab=vocab,
-        transform=transform,
+        transform=val_transform,
         batch_size=batch_size,
         shuffle=False,
         num_workers=workers,
         collate_fn=collate_fn
     )
+
     return train_loader, val_loader
 
 
@@ -177,4 +195,5 @@ def get_test_loader(vocab, batch_size, workers):
         num_workers=workers,
         collate_fn=collate_fn
     )
+
     return test_loader

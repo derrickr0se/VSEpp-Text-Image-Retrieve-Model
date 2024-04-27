@@ -29,12 +29,14 @@ def main():
     if args.model_class == 'CNN_and_GRU':
         # 加载词汇表
         vocab = pickle.load(open(os.path.join(args.vocab_path, 'flickr30k_vocab.pkl'), 'rb'))
+
         # 加载DataLoader
-        train_loader, val_loader = data_process.get_train_dev_loader(
+        train_loader, val_loader = data_process.get_train_val_loader(
             vocab,
             args.batch_size,
             args.workers
         )
+
         # 构建模型
         model = VSE(
             args.embed_size,
@@ -96,7 +98,8 @@ def main():
             model.optimizer,
             epoch
         )
-        # 每个epoch训练模型
+
+        # 训练一个epoch
         main_train(
             args.log_step,
             args.val_step,
@@ -111,6 +114,7 @@ def main():
 
         is_best = r_sum > best_rsum  # 确定当前的 r_sum 是否是历史最佳值
         best_rsum = max(r_sum, best_rsum)
+        # 保存本轮epoch的检查点
         save_checkpoint(
             {
                 'epoch': epoch + 1,  # epoch从0开始
@@ -144,30 +148,38 @@ def main_train(log_step, val_step, train_loader, val_loader, model, epoch):
     """
     batch_time_meter = AverageMeter()
     data_time_meter = AverageMeter()
-
     train_logger = LogCollector()
 
     model.train_model()  # 设置模型为训练模式
+
     start_time = time.time()  # 记录初始时间
+
     # 训练充足再使用max_violation
     if args.max_violation_in_middle and epoch > (1 / 3) * args.num_epochs:  # 尽量在过拟合之前切换max_violation
         model.use_InfoNCE_loss = True
 
     for index, train_data in enumerate(train_loader):
-        data_time_meter.update(time.time() - start_time)  # 将data_time_meter.val的值更新为当前批次数据加载所花费的时间
+        # 更新数据加载时间
+        data_time_meter.update(time.time() - start_time)
+
+        # 确保使用了train_logger
         model.logger = train_logger
+
+        # 更新模型
         images, captions, lengths, _ = train_data  # 从collate_fn中取出当前批次的数据
         model.train(images, captions, lengths)  # 将数据送入模型中进行本批次的训练
-        batch_time_meter.update(time.time() - start_time)  # 将batch_time_meter.val的值更新为当前批次数据训练所花费的时间
+
+        # 更新运行时间
+        batch_time_meter.update(time.time() - start_time)
         start_time = time.time()
 
         # 打印日志到控制台
-        if model.whole_iters % log_step == 0:  # 每训练log_step个batch就打印一次日志
+        if model.whole_iters % log_step == 0:
             logging.info(
                 'Epoch: [{epoch}][{index}/{length}]\t'
                 'Loss: {e_log}\t'
-                'Batch_time: {batch_time_meter.val:.3f} (average: {batch_time_meter.avg:.3f})\t'
-                'Data_time: {data_time_meter.val:.3f} (average: {data_time_meter.avg:.3f})\t'
+                'Batch_time: {batch_time_meter.val:.3f} (avg: {batch_time_meter.avg:.3f})\t'
+                'Data_time: {data_time_meter.val:.3f} (avg: {data_time_meter.avg:.3f})\t'
                 .format(
                     epoch=epoch,  # 当前的epoch
                     index=index,  # 当前batch的索引
@@ -178,7 +190,7 @@ def main_train(log_step, val_step, train_loader, val_loader, model, epoch):
                 )
             )
 
-        # 记录到tensorboard
+        # 记录日志到tensorboard
         tb_logger.log_value('batch_time_meter', batch_time_meter.val, model.whole_iters)
         tb_logger.log_value('data_time_meter', data_time_meter.val, model.whole_iters)
         model.logger.tensorboard_log(tb_logger, step=model.whole_iters)
@@ -189,12 +201,14 @@ def main_train(log_step, val_step, train_loader, val_loader, model, epoch):
 
 
 def validate(log_step, val_loader, model):
+    # 计算所有验证集图片和文本的编码
     img_embs, cap_embs = encode_data(
         model,
         val_loader,
         log_step,
         logging.info
     )
+
     #  以图搜文
     r_im2cap_1, r_im2cap_5, r_im2cap_10, r_im2cap_medi, r_im2cap_mean = r_img2cap(
         img_embs,
@@ -202,6 +216,7 @@ def validate(log_step, val_loader, model):
     )
     logging.info("Image to caption: %.1f, %.1f, %.1f, %.1f, %.1f" % (
         r_im2cap_1, r_im2cap_5, r_im2cap_10, r_im2cap_medi, r_im2cap_mean))
+
     # 以文搜图
     r_cap2im_1, r_cap2im_5, r_cap2im_10, r_cap2im_medi, r_cap2im_mean = r_cap2img(
         img_embs,
@@ -210,10 +225,10 @@ def validate(log_step, val_loader, model):
     logging.info("Caption to image: %.1f, %.1f, %.1f, %.1f, %.1f" % (
         r_cap2im_1, r_cap2im_5, r_cap2im_10, r_cap2im_medi, r_cap2im_mean))
 
-    # r_sum
+    # 计算r_sum
     r_sum = r_im2cap_1 + r_im2cap_5 + r_im2cap_10 + r_cap2im_1 + r_cap2im_5 + r_cap2im_10
 
-    # 记录到tensorboard上
+    # 记录到tensorboard
     tb_logger.log_value('r_im2cap_1', r_im2cap_1, model.whole_iters)
     tb_logger.log_value('r_im2cap_5', r_im2cap_5, model.whole_iters)
     tb_logger.log_value('r_im2cap_10', r_im2cap_10, model.whole_iters)

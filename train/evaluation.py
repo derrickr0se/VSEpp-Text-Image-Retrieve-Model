@@ -23,36 +23,39 @@ else:
 
 class AverageMeter(object):
     """
-        计算并且存储当前值和总计平均值(平滑)
+        计算并且存储当前值和总计平均值
     """
-
     def __init__(self):
         self.val = 0
         self.avg = 0
         self.sum = 0
         self.count = 0
 
-    def update(self, val, n=1):
+    def update(self, val, n=0):  # n为数量,用于计算平均值
         self.val = val
         self.sum += val * n
         self.count += n
         self.avg = self.sum / (self.count + 1e-5)
 
-    def __str__(self):  # 打印loss当前值和平均值
+    def __str__(self):
+        """
+            用于日志记录的字符串表示
+        """
+        # 用于应该准确记录的值，如迭代次数
         if self.count == 0:
             return str(self.val)
-        return '%.4f (average: %.4f)' % (self.val, self.avg)
+        # 用于统计数据
+        return '%.4f (avg: %.4f)' % (self.val, self.avg)
 
 
 class LogCollector(object):
     """
-        记录train和val的logging的对象
+        记录train和val的logging对象
     """
-
     def __init__(self):
-        self.meters = OrderedDict()  # meters是一个有序字典
+        self.meters = OrderedDict()  # meters是一个有序字典,保证记录变量的顺序具有确定性
 
-    def update(self, key, value, n=1):
+    def update(self, key, value, n=0):
         if key not in self.meters:  # 没有当前键，先创建
             self.meters[key] = AverageMeter()
         self.meters[key].update(value, n)  # 更新值
@@ -71,48 +74,57 @@ class LogCollector(object):
 
 
 def encode_data(model, data_loader, log_step=10, logging=print):
+    """
+        对data_loader可加载的所有图像和字幕进行编码
+    """
     batch_time_meter = AverageMeter()
     val_logger = LogCollector()
+
     model.val_model()
 
     start_time = time.time()
+
     img_embs = None
     cap_embs = None
     isInit = False
 
     for index, (images, captions, lengths, ids) in enumerate(data_loader):
-        model.logger = val_logger
+        model.logger = val_logger  # 确保使用了val_logger
 
         with torch.no_grad():  # 禁用梯度计算,加速推断过程
-            img_emb, cap_emb = model.forward(images, captions, lengths)  # (batch_size , embed_dim)
+            # 计算embeddings,形状为 (batch_size , embed_dim)
+            img_emb, cap_emb = model.forward(images, captions, lengths)
 
-            # 初始化
+            # 初始化数组
             if not isInit:
                 img_embs = np.zeros((len(data_loader.dataset), img_emb.shape[1]))  # (batch_size , embed_dim)
                 cap_embs = np.zeros((len(data_loader.dataset), cap_emb.shape[1]))
                 isInit = True
 
+            # 通过从gpu复制并转换为numpy来保留embeddings
             img_embs[ids] = img_emb.data.cpu().numpy().copy()  # 转移到cpu上以便进行numpy().copy()
             cap_embs[ids] = cap_emb.data.cpu().numpy().copy()
 
-            model.calc_loss(img_emb, cap_emb)  # 不用接返回值，只需要其中记录到logger的功能
+            # 不用接返回值，只需要其中记录loss到logger的功能
+            model.calc_loss(img_emb, cap_emb)
 
+        # 更新运行时间
         batch_time_meter.update(time.time() - start_time)
+        start_time = time.time()
 
-        if index % log_step == 0:  # 打印日志
+        # 打印日志
+        if index % log_step == 0:
             logging(
                 'Test: [{index}/{len}]\t'
                 '{e_log}\t'
-                'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                'Time: {batch_time.val:.3f} (avg: {batch_time.avg:.3f})\t'
                 .format(
                     index=index,
                     len=len(data_loader),
-                    e_log=model.logger,
+                    e_log=str(model.logger),
                     batch_time=batch_time_meter
                 )
             )
-
-            start_time = time.time()
 
     return img_embs, cap_embs
 
@@ -122,17 +134,20 @@ def r_img2cap(img_embs, cap_embs):
         计算以图搜文的召回率指标
     """
     image_num = int(img_embs.shape[0] / 5)  # 一张图片对应五条文本
+
     # ranks[i] : 与第i张图片最匹配的正样本文本在对应第i张图片的sim_score_i中的下标
     # 例如,ranks[3] = 6，说明与第4张图片最匹配的正样本文本(对应的五条文本中相似度最大的那个)在其sim_score中的下标为6，即第7大相似的，那么算r_im2cap_1和r_im2cap_5时都不能算在内
     ranks = np.zeros(image_num)
     for index in range(image_num):
         # 获取查询图片，形状为(1 , embed_dim)
-        image = img_embs[5 * index].reshape(1, img_embs.shape[1])
+        img = img_embs[5 * index].reshape(1, img_embs.shape[1])
+
         # 计算每个图片对应的相似度矩阵，形状为(1 , batch_size)
-        sim_score_i = np.dot(image, cap_embs.T)  # sim_score_i[5 * i] ~ sim_score_i[5 * i + 4]对应第 i 张图片与其匹配的五条文本(正样本)
+        sim_score_i = np.dot(img, cap_embs.T)  # sim_score_i[5 * i] ~ sim_score_i[5 * i + 4]对应第 i 张图片与其匹配的五条文本(正样本)
         # 先对sim_score进行升序排序，然后利用[::-1]倒序排列,indices记录排序后的索引
         indices = np.argsort(sim_score_i[0])[::-1]  # 下标范围 : 0 ~ batch_size-1,下标越小相似度越大
-        min_indice = 1000000000  # 记录最小索引
+
+        min_indice = 1e20  # 记录最小索引
         """
             np.where(indices == i)以元组形式(array,dtype)返回所有满足indices == i元素的索引,第一个[0]取出其中的array部分,第二个[0]取出array中第一个元素
         """
@@ -158,15 +173,16 @@ def r_cap2img(img_embs, cap_embs):
     """
     image_num = int(img_embs.shape[0] / 5)
     imgs = np.array([img_embs[5 * i] for i in range(image_num)])  # (image_num , embed_dim)
-    ranks = np.zeros(img_embs.shape[0])  # (batch_size , 1)
 
+    ranks = np.zeros(img_embs.shape[0])  # (batch_size , 1)
     for index in range(image_num):
         # 获取查询文本,形状为 (5 , embed_dim)
         caps = cap_embs[5 * index: 5 * index + 5]  # 对应索引为index的图片与其匹配的五条文本(正样本)
+
         # 计算相似度矩阵,形状为 (5 , image_num)
         sim_score = np.dot(caps, imgs.T)
-        indices = np.zeros(sim_score.shape)
 
+        indices = np.zeros(sim_score.shape)
         for i in range(len(indices)):
             indices[i] = np.argsort(sim_score[i])[::-1]  # 对indices每一行进行降序排序
             ranks[5 * index + i] = np.where(indices[i] == index)[0][0]  # 文本对于图片的正样本是唯一的，不必再去找最匹配的那一个

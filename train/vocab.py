@@ -91,8 +91,10 @@ def build_vocab(data_path, data_name, threshold):
     for index, caption in tqdm(enumerate(captions)):
         tokens = nltk.tokenize.word_tokenize(caption.lower())
         counter.update(tokens)  # 更新计数器
+        if index % 1000 == 0:
+            print("[%d/%d] tokenized the captions." % (index, len(captions)))
 
-    # 使用items()方法获取所有键值对，将词频高于阈值的词添加到words中
+    # 使用items()方法获取所有键值对，将词频不低于阈值的词添加到words中
     words = [word for word, cnt in counter.items() if cnt >= threshold]
 
     # 初始化词汇表，添加特殊标记
@@ -114,7 +116,6 @@ def initiate(data_path, data_name):
         初始化词汇表并将其保存到指定路径下
     """
     vocab = build_vocab(data_path, data_name, threshold=3)
-    # 打印词汇表的长度
     print(f"length of vocabulary : {vocab.__len__()}")
     # 将构建好的词汇表对象保存到pickle文件中
     with open('../vocab/flickr30k_vocab.pkl', 'wb') as file:
